@@ -236,7 +236,7 @@ def process_iq_data(raw_data, dtype, n_channels, fs, bits_per_sample):
 
 
 if __name__ == "__main__":
-    wav_file = "groupe_20M.wav"  
+    wav_file = "/Users/alielboury/Documents/Learning/S9/Proj_GNSS/gps/groupe_20M.wav"  
     
     try:
         iq_data, fs = inspect_gps_wav(wav_file, duration_seconds=2)
