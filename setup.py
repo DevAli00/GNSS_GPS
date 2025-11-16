@@ -91,7 +91,7 @@ def inspect_gps_wav(filename, duration_seconds=2):
                     print(f"\n✂️  Loading first {duration_seconds} seconds ({chunk_frames:,} frames)")
                     print(f"  Bytes to read: {bytes_to_read / (1024**2):.1f} MB")
                     
-                    # Read the data chunk
+                    # Read data chunk
                     raw_data = f.read(bytes_to_read)
                     
                     # Determine dtype
