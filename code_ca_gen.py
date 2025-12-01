@@ -10,20 +10,25 @@ TAP_TABLE = np.array([
     [4, 10]
 ])
 
-def generate_ca_code(prn_list, fs_ratio=1.0):
+def generate_ca_code(prn_list, fs_ratio=1.0, bipolar=False):
     """
     Traduction Python du fichier cacode.m de votre professeur.
     
     Args:
         prn_list (list ou np.array): Une liste de PRN à générer (ex: [5] ou [6, 12]).
         fs_ratio (float): Le ratio d'échantillonnage (fs_wav / 1.023e6).
+        bipolar (bool): Si True, retourne des valeurs -1 et 1. Si False (défaut), 0 et 1.
     
     Returns:
-        np.array: Une matrice (ou un vecteur) des codes C/A (0s et 1s).
+        np.array: Une matrice (ou un vecteur) des codes C/A.
                   Si N PRNs sont demandés, la forme est (N, 1023 * fs_ratio).
     """
     
-    prn_list = np.array(prn_list)
+    # Handle scalar input
+    if np.isscalar(prn_list):
+        prn_list = np.array([prn_list])
+    else:
+        prn_list = np.array(prn_list)
     
     # --- Validation des entrées (comme dans le .m) ---
     if fs_ratio < 1:
@@ -78,13 +83,12 @@ def generate_ca_code(prn_list, fs_ratio=1.0):
         g2_reg[0] = feedback_g2
 
     # --- Upsampling (si demandé) ---
+    # --- Upsampling (si demandé) ---
     if fs_ratio == 1.0:
-        return np.squeeze(g) # Retourne un vecteur simple si 1 PRN
-        
+        result = np.squeeze(g)
     else:
         # C'est la traduction de la boucle "zero order hold"
         L_upsampled = int(np.floor(L * fs_ratio))
-        g_upsampled = np.zeros((len(prn_list), L_upsampled), dtype=int)
         
         # Indices pour le ré-échantillonnage
         indices = np.ceil(np.arange(1, L_upsampled + 1) / fs_ratio).astype(int) - 1
@@ -92,5 +96,10 @@ def generate_ca_code(prn_list, fs_ratio=1.0):
         indices[indices > L-1] = L-1 
 
         g_upsampled = g[:, indices]
-            
-        return np.squeeze(g_upsampled) # Retourne un vecteur simple si 1 PRN
+        result = np.squeeze(g_upsampled)
+
+    # Convert to bipolar if requested: 0 -> 1, 1 -> -1
+    if bipolar:
+        result = 1 - 2 * result
+        
+    return result

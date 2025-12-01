@@ -5,9 +5,8 @@ import code_ca_gen
 
 def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, doppler_step=500):
     """
-    Performs GPS satellite acquisition using FFT-based correlation.
-    Searches for satellites by correlating received signal with CA codes
-    over a 2D space: Code Phase vs. Doppler Frequency.
+    Performs GPS satellite acquisition using Parallel Code Phase Search.
+    Optimized to pre-compute Code FFTs and shift signal for Doppler.
     
     Args:
         data_chunk (np.array): Raw IF signal (1D complex array, 1 ms minimum)
@@ -55,54 +54,62 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
     n_prns = len(prn_list)
     
     print("=" * 70)
-    print("GPS ACQUISITION ALGORITHM")
+    print("GPS ACQUISITION ALGORITHM (OPTIMIZED)")
     print("=" * 70)
     print(f"Sample rate: {sample_rate / 1e6:.3f} MHz")
     print(f"Data length: {n_samples} samples ({n_samples / sample_rate * 1e3:.2f} ms)")
-    print(f"Upsample ratio: {upsample_ratio:.2f}x")
-    print(f"Upsampled code length: {upsampled_code_length} samples")
     print(f"Doppler search: ±{doppler_range} Hz with {doppler_step} Hz step")
     print(f"Number of Dopplers: {n_dopplers}")
-    print(f"PRNs to search: {list(prn_list)}")
+    print(f"PRNs to search: {len(prn_list)}")
     print("=" * 70)
     
     # Storage for results
     peaks = np.zeros((n_prns, n_dopplers), dtype=float)
     code_phases = np.zeros((n_prns, n_dopplers), dtype=int)
     
-    # FFT of received signal (computed once)
-    fft_signal = np.fft.fft(data_chunk, n=upsampled_code_length)
+    # --- Pre-compute FFT of C/A Codes ---
+    print("\n⚡ Pre-computing C/A Code FFTs...")
+    ca_codes_fft = {}
     
-    # --- Main Acquisition Loop ---
-    print("\n🔍 Searching for satellites...\n")
-    
-    for prn_idx, prn in enumerate(prn_list):
-        print(f"PRN {prn:2d}: ", end="", flush=True)
-        
+    for prn in prn_list:
         # Generate CA code for this PRN
         ca_code = code_ca_gen.generate_ca_code(prn, bipolar=True)
         
         # Upsample CA code to match sample rate
         upsampled_code = np.repeat(ca_code, int(np.ceil(upsample_ratio)))
-        upsampled_code = upsampled_code[:upsampled_code_length]
+        upsampled_code = upsampled_code[:n_samples]
         
-        # Normalize
-        upsampled_code = upsampled_code / np.sqrt(np.sum(upsampled_code ** 2))
+        # Compute FFT and store (conjugate for correlation)
+        ca_codes_fft[prn] = np.conj(np.fft.fft(upsampled_code))
         
-        # Loop over Doppler frequencies
-        for dop_idx, doppler in enumerate(dopplers):
+    print("✅ C/A Codes prepared.")
+    
+    # --- Main Acquisition Loop ---
+    print("\n🔍 Searching for satellites (Doppler Iteration)...\n")
+    
+    # Loop over Doppler frequencies
+    for dop_idx, doppler in enumerate(dopplers):
+        if dop_idx % 5 == 0:
+            print(f"Processing Doppler {doppler:+5.0f} Hz ({dop_idx+1}/{n_dopplers})...")
             
-            # Apply Doppler shift to CA code
-            # Doppler phase: 2*pi*f_doppler*t where t = sample_index / sample_rate
-            doppler_phase = 2 * np.pi * doppler * np.arange(upsampled_code_length) / sample_rate
-            doppler_modulation = np.exp(1j * doppler_phase)
-            test_code = upsampled_code * doppler_modulation
+        # Remove Doppler from signal (Baseband rotation)
+        # exp(-j * 2 * pi * f_d * t)
+        doppler_removal = np.exp(-1j * 2 * np.pi * doppler * time_vector)
+        baseband_signal = data_chunk * doppler_removal
+        
+        # FFT of signal (computed once per Doppler)
+        fft_signal = np.fft.fft(baseband_signal)
+        
+        # Correlate with all PRNs
+        for prn_idx, prn in enumerate(prn_list):
+            # Frequency domain correlation: FFT(Signal) * conj(FFT(Code))
+            # We already stored conj(FFT(Code))
+            correlation_spectrum = fft_signal * ca_codes_fft[prn]
             
-            # FFT correlation (Winograd's Fast Convolution)
-            fft_code = np.fft.fft(test_code, n=upsampled_code_length)
-            correlation = np.fft.ifft(fft_signal * np.conj(fft_code))
+            # IFFT to get time domain correlation
+            correlation = np.fft.ifft(correlation_spectrum)
             
-            # Find peak magnitude and its position
+            # Find peak
             abs_correlation = np.abs(correlation)
             peak_value = np.max(abs_correlation)
             peak_phase = np.argmax(abs_correlation)
@@ -110,12 +117,7 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
             # Store results
             peaks[prn_idx, dop_idx] = peak_value
             code_phases[prn_idx, dop_idx] = peak_phase
-        
-        # Progress indicator
-        max_peak = np.max(peaks[prn_idx, :])
-        max_doppler_idx = np.argmax(np.max(peaks[prn_idx, :], axis=0))
-        print(f"Max peak: {max_peak:.2f} (Doppler: {dopplers[max_doppler_idx]:+.0f} Hz)")
-    
+
     # --- Post-Processing: Detect Satellites ---
     print("\n" + "=" * 70)
     print("DETECTION RESULTS")
@@ -124,7 +126,7 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
     # Compute threshold (adaptive)
     mean_peak = np.mean(peaks)
     std_peak = np.std(peaks)
-    threshold = mean_peak + 5 * std_peak  # 5-sigma rule (stricter)
+    threshold = mean_peak + 5 * std_peak  # 5-sigma rule
     
     print(f"Mean correlation peak: {mean_peak:.2f}")
     print(f"Std deviation: {std_peak:.2f}")
