@@ -3,17 +3,19 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 import code_ca_gen
 
-def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, doppler_step=500):
+def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, doppler_step=500, non_coherent_integration=1):
     """
     Performs GPS satellite acquisition using Parallel Code Phase Search.
     Optimized to pre-compute Code FFTs and shift signal for Doppler.
+    Supports Non-Coherent Integration for improved sensitivity.
     
     Args:
-        data_chunk (np.array): Raw IF signal (1D complex array, 1 ms minimum)
+        data_chunk (np.array): Raw IF signal (1D complex array)
         sample_rate (float): Sampling frequency in Hz (e.g., 2.048e6)
         prn_list (list): PRNs to search (default 1-32)
         doppler_range (int): Doppler search range in Hz (±doppler_range)
         doppler_step (int): Doppler search step in Hz
+        non_coherent_integration (int): Number of 1ms blocks to accumulate (default 1)
     
     Returns:
         results (dict): Dictionary containing:
@@ -36,17 +38,22 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
     
     # Use 1 ms of data (one complete C/A code period)
     coherent_integration_time = 1e-3  # 1 millisecond
-    n_samples = int(sample_rate * coherent_integration_time)
+    samples_per_ms = int(sample_rate * coherent_integration_time)
     
-    # Trim data to exact length
-    if len(data_chunk) < n_samples:
-        print(f"⚠️  Warning: data_chunk ({len(data_chunk)} samples) < required {n_samples} samples")
-        n_samples = len(data_chunk)
+    # Check data length
+    required_samples = samples_per_ms * non_coherent_integration
+    if len(data_chunk) < required_samples:
+        print(f"⚠️  Warning: data_chunk ({len(data_chunk)} samples) < required {required_samples} samples")
+        # Adjust integration time to fit data
+        non_coherent_integration = len(data_chunk) // samples_per_ms
+        print(f"   Reduced integration to {non_coherent_integration} ms")
+        if non_coherent_integration < 1:
+            raise ValueError("Not enough data for even 1ms integration")
     
-    data_chunk = data_chunk[:n_samples]
-    
-    # Time vector for Doppler modulation
-    time_vector = np.arange(n_samples) / sample_rate
+    # Time vector for Doppler modulation (1ms)
+    # We use the same time vector for each chunk because we treat them as independent for non-coherent
+    # (Phase continuity is lost in abs(), but Doppler frequency shift is constant)
+    time_vector_1ms = np.arange(samples_per_ms) / sample_rate
     
     # Doppler frequency array
     dopplers = np.arange(-doppler_range, doppler_range + doppler_step, doppler_step)
@@ -57,7 +64,7 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
     print("GPS ACQUISITION ALGORITHM (OPTIMIZED)")
     print("=" * 70)
     print(f"Sample rate: {sample_rate / 1e6:.3f} MHz")
-    print(f"Data length: {n_samples} samples ({n_samples / sample_rate * 1e3:.2f} ms)")
+    print(f"Integration time: {non_coherent_integration} ms (Non-Coherent)")
     print(f"Doppler search: ±{doppler_range} Hz with {doppler_step} Hz step")
     print(f"Number of Dopplers: {n_dopplers}")
     print(f"PRNs to search: {len(prn_list)}")
@@ -77,7 +84,7 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
         
         # Upsample CA code to match sample rate
         upsampled_code = np.repeat(ca_code, int(np.ceil(upsample_ratio)))
-        upsampled_code = upsampled_code[:n_samples]
+        upsampled_code = upsampled_code[:samples_per_ms]
         
         # Compute FFT and store (conjugate for correlation)
         ca_codes_fft[prn] = np.conj(np.fft.fft(upsampled_code))
@@ -92,30 +99,44 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
         if dop_idx % 5 == 0:
             print(f"Processing Doppler {doppler:+5.0f} Hz ({dop_idx+1}/{n_dopplers})...")
             
-        # Remove Doppler from signal (Baseband rotation)
-        # exp(-j * 2 * pi * f_d * t)
-        doppler_removal = np.exp(-1j * 2 * np.pi * doppler * time_vector)
-        baseband_signal = data_chunk * doppler_removal
+        # Pre-process signal chunks for this Doppler
+        # We shift and FFT each 1ms chunk
+        fft_chunks = []
         
-        # FFT of signal (computed once per Doppler)
-        fft_signal = np.fft.fft(baseband_signal)
+        # Doppler removal vector (1ms)
+        doppler_removal = np.exp(-1j * 2 * np.pi * doppler * time_vector_1ms)
+        
+        for i in range(non_coherent_integration):
+            chunk = data_chunk[i*samples_per_ms : (i+1)*samples_per_ms]
+            
+            # Remove Doppler
+            baseband_chunk = chunk * doppler_removal
+            
+            # FFT
+            fft_chunks.append(np.fft.fft(baseband_chunk))
         
         # Correlate with all PRNs
         for prn_idx, prn in enumerate(prn_list):
-            # Frequency domain correlation: FFT(Signal) * conj(FFT(Code))
-            # We already stored conj(FFT(Code))
-            correlation_spectrum = fft_signal * ca_codes_fft[prn]
             
-            # IFFT to get time domain correlation
-            correlation = np.fft.ifft(correlation_spectrum)
+            # Accumulate correlation power
+            sum_correlation_power = np.zeros(samples_per_ms, dtype=float)
             
-            # Find peak
-            abs_correlation = np.abs(correlation)
-            peak_value = np.max(abs_correlation)
-            peak_phase = np.argmax(abs_correlation)
+            for i in range(non_coherent_integration):
+                # Frequency domain correlation
+                correlation_spectrum = fft_chunks[i] * ca_codes_fft[prn]
+                
+                # IFFT
+                correlation = np.fft.ifft(correlation_spectrum)
+                
+                # Accumulate Power (Mag^2)
+                sum_correlation_power += np.abs(correlation)**2
             
-            # Store results
-            peaks[prn_idx, dop_idx] = peak_value
+            # Find peak in accumulated power
+            peak_power = np.max(sum_correlation_power)
+            peak_phase = np.argmax(sum_correlation_power)
+            
+            # Store results (take sqrt to return magnitude equivalent)
+            peaks[prn_idx, dop_idx] = np.sqrt(peak_power)
             code_phases[prn_idx, dop_idx] = peak_phase
 
     # --- Post-Processing: Detect Satellites ---
@@ -143,12 +164,13 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
         code_phase = code_phases[prn_idx, max_peak_idx]
         
         if peak > threshold:
+            z_score = (peak - mean_peak) / std_peak
             detections.append({
                 'prn': prn,
                 'doppler': doppler,
                 'code_phase': code_phase,
                 'peak': peak,
-                'snr': peak / (mean_peak + std_peak)  # Rough SNR estimate
+                'snr': z_score  # Z-score (SNR)
             })
     
     # Sort by peak magnitude (strongest first)
@@ -157,13 +179,18 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
     print(f"\n🛰️  Satellites Detected: {len(detections)}\n")
     
     if detections:
-        print(f"{'PRN':<5} {'Doppler (Hz)':<15} {'Code Phase':<15} {'Peak':<10} {'SNR (dB)':<10}")
+        print(f"{'PRN':<5} {'Doppler (Hz)':<15} {'Code Phase':<15} {'Peak':<10} {'SNR (sigma)':<10}")
         print("-" * 60)
         for det in detections:
-            snr_db = 10 * np.log10(det['snr'] + 1e-10)
-            print(f"{det['prn']:<5} {det['doppler']:+11.0f}   {det['code_phase']:<14} {det['peak']:<10.2f} {snr_db:<10.2f}")
+            print(f"{det['prn']:<5} {det['doppler']:+11.0f}   {det['code_phase']:<14} {det['peak']:<10.2f} {det['snr']:<10.2f}")
     else:
-        print("❌ No satellites detected. Try adjusting threshold or check your data.")
+        print("❌ No satellites detected.")
+        # Print the strongest peak anyway for debugging
+        max_peak_idx = np.argmax(peaks)
+        prn_idx, dop_idx = np.unravel_index(max_peak_idx, peaks.shape)
+        max_peak = peaks[prn_idx, dop_idx]
+        print(f"   Strongest candidate: PRN {prn_list[prn_idx]} at {dopplers[dop_idx]} Hz (Peak: {max_peak:.2f})")
+        print("   Try adjusting threshold or checking your data.")
     
     print("=" * 70)
     
@@ -183,13 +210,14 @@ def run_acquisition(data_chunk, sample_rate, prn_list=None, doppler_range=5000, 
     return results
 
 
-def plot_acquisition_results(results, title="GPS Acquisition Results"):
+def plot_acquisition_results(results, title="GPS Acquisition Results", save_path=None):
     """
     Create visualizations of acquisition results.
     
     Args:
         results (dict): Output from run_acquisition()
         title (str): Plot title
+        save_path (str): Optional path to save the plot (e.g., 'plots/acquisition.png')
     """
     
     peaks = results['peaks']
@@ -264,26 +292,38 @@ def plot_acquisition_results(results, title="GPS Acquisition Results"):
     
     plt.suptitle(title, fontsize=16, fontweight='bold', y=1.00)
     plt.tight_layout()
-    plt.show()
+    
+    if save_path:
+        import os
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+        print(f"✅ Plot saved to {save_path}")
+    else:
+        plt.show()
     
     # --- Plot 5: 3D Surface Plot (optional, slower) ---
-    fig2 = plt.figure(figsize=(14, 8))
-    ax5 = fig2.add_subplot(111, projection='3d')
+    # Only show/save 3D plot if explicitly requested or if we are not saving (interactive mode)
+    # For now, let's skip saving 3D plot to avoid complexity, or save it as a separate file if needed.
+    # We will just comment it out for the save path to keep it simple, or we can save it too.
     
-    # Create mesh grid
-    doppler_indices = np.arange(len(dopplers))
-    prn_indices = np.arange(len(prn_list))
-    doppler_mesh, prn_mesh = np.meshgrid(doppler_indices, prn_indices)
-    
-    # Plot surface
-    surf = ax5.plot_surface(doppler_mesh, prn_mesh, peaks, cmap='hot', alpha=0.8)
-    ax5.set_xlabel('Doppler Index')
-    ax5.set_ylabel('PRN')
-    ax5.set_zlabel('Correlation Magnitude')
-    ax5.set_title('3D View: Acquisition Search Space', fontweight='bold')
-    
-    fig2.colorbar(surf, ax=ax5, label='Correlation Magnitude')
-    plt.show()
+    if not save_path:
+        fig2 = plt.figure(figsize=(14, 8))
+        ax5 = fig2.add_subplot(111, projection='3d')
+        
+        # Create mesh grid
+        doppler_indices = np.arange(len(dopplers))
+        prn_indices = np.arange(len(prn_list))
+        doppler_mesh, prn_mesh = np.meshgrid(doppler_indices, prn_indices)
+        
+        # Plot surface
+        surf = ax5.plot_surface(doppler_mesh, prn_mesh, peaks, cmap='hot', alpha=0.8)
+        ax5.set_xlabel('Doppler Index')
+        ax5.set_ylabel('PRN')
+        ax5.set_zlabel('Correlation Magnitude')
+        ax5.set_title('3D View: Acquisition Search Space', fontweight='bold')
+        
+        fig2.colorbar(surf, ax=ax5, label='Correlation Magnitude')
+        plt.show()
 
 
 # --- MAIN TEST SCRIPT ---
@@ -343,6 +383,6 @@ if __name__ == "__main__":
     
     # --- Plot Results ---
     print("\n📊 Generating plots...\n")
-    plot_acquisition_results(results, title="GPS Acquisition - Simulation Results")
+    plot_acquisition_results(results, title="GPS Acquisition - Simulation Results", save_path="plots/acquisition_simulation.png")
     
     print("\n✅ Acquisition complete!\n")

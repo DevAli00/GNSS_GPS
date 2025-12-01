@@ -151,34 +151,73 @@ def process_iq_data(raw_data, dtype, n_channels, fs, bits_per_sample):
     print(f"  Data Type: {chunk.dtype}")
     print(f"  Memory Used: {chunk.nbytes / (1024**2):.1f} MB")
     
+    # Print raw data statistics BEFORE normalization
+    print(f"\n📊 Raw Data Statistics (Before Normalization):")
+    if n_channels == 2:
+        print(f"  I-channel: min={chunk[:, 0].min():6d}, max={chunk[:, 0].max():6d}, mean={chunk[:, 0].mean():.2f}")
+        print(f"  Q-channel: min={chunk[:, 1].min():6d}, max={chunk[:, 1].max():6d}, mean={chunk[:, 1].mean():.2f}")
+    else:
+        print(f"  Data: min={chunk.min():6d}, max={chunk.max():6d}, mean={chunk.mean():.2f}")
+    
     # Handle stereo IQ data
     if n_channels == 2:
-        print(f"  Stereo file detected: IQ data")
-        # Normalize to [-1, 1] range
-        max_val = 2**(bits_per_sample - 1) - 1
-        i_channel = chunk[:, 0].astype(np.float32) / max_val
-        q_channel = chunk[:, 1].astype(np.float32) / max_val
+        print(f"\n  Stereo file detected: IQ data")
+        
+        # Convert to float WITHOUT normalization first
+        i_channel = chunk[:, 0].astype(np.float32)
+        q_channel = chunk[:, 1].astype(np.float32)
+        
+        # Print raw float statistics
+        print(f"\n  Raw float I-channel RMS: {np.sqrt(np.mean(i_channel**2)):.2f}")
+        print(f"  Raw float Q-channel RMS: {np.sqrt(np.mean(q_channel**2)):.2f}")
+        
+        # Create complex signal (not normalized yet)
         iq_data = i_channel + 1j * q_channel
+        
     else:
         print("  Mono file - treating as real data")
-        max_val = 2**(bits_per_sample - 1) - 1
-        iq_data = (chunk.astype(np.float32) / max_val).astype(complex)
+        iq_data = chunk.astype(np.float32).astype(complex)
     
-    print(f"  IQ Data Shape: {iq_data.shape}")
-    print(f"  IQ Data Type: {iq_data.dtype}")
-
-    #    This spike is at the very beginning. Let's skip the first 5000 samples.
-    transient_skip = 5000
+    # Calculate RMS BEFORE any processing
+    rms_before = np.sqrt(np.mean(np.abs(iq_data)**2))
+    print(f"\n  Complex signal RMS (before normalization): {rms_before:.2f}")
+    
+    # Skip transient - use 0.5 seconds instead of fixed 5000 samples
+    transient_skip = int(0.5 * fs)  # 0.5 seconds
     if len(iq_data) > transient_skip:
-        print(f"\n🧼  Cleaning: Skipping first {transient_skip} transient samples...")
+        print(f"\n🧼  Cleaning: Skipping first {transient_skip} transient samples ({transient_skip/fs:.2f}s)...")
         iq_data = iq_data[transient_skip:]
     else:
-        print("\n⚠️  Warning: Data chunk is too small to remove transient.")
-        
-    # 2. Remove the DC bias (the spike at 0 Hz)
-    #    We do this by subtracting the mean of the signal from all samples.
+        print(f"\n⚠️  Warning: Data chunk is too small to remove {transient_skip} transient samples.")
+        print(f"   Skipping first 5000 samples instead...")
+        if len(iq_data) > 5000:
+            iq_data = iq_data[5000:]
+    
+    # Remove DC bias
     print(f"🧼  Cleaning: Removing DC bias...")
     iq_data = iq_data - np.mean(iq_data)
+    
+    # AGC Normalization: Normalize by RMS to target level
+    rms_after_dc = np.sqrt(np.mean(np.abs(iq_data)**2))
+    target_rms = 0.15  # Target RMS level (empirically chosen for GPS)
+    
+    print(f"\n⚡ AGC Normalization:")
+    print(f"  Current RMS: {rms_after_dc:.4f}")
+    print(f"  Target RMS:  {target_rms:.4f}")
+    
+    if rms_after_dc > 0:
+        agc_gain = target_rms / rms_after_dc
+        iq_data = iq_data * agc_gain
+        print(f"  AGC Gain: {agc_gain:.4f}x")
+    else:
+        print(f"  ⚠️  Warning: RMS is zero, skipping AGC")
+    
+    # Final statistics
+    final_rms = np.sqrt(np.mean(np.abs(iq_data)**2))
+    print(f"  Final RMS: {final_rms:.4f}")
+    
+    print(f"\n  IQ Data Shape: {iq_data.shape}")
+    print(f"  IQ Data Type: {iq_data.dtype}")
     
     # Compute spectrum
     print("\n🔍 Computing FFT spectrum...")
@@ -232,7 +271,12 @@ def process_iq_data(raw_data, dtype, n_channels, fs, bits_per_sample):
     print(f"  RMS: {np.sqrt(np.mean(np.abs(iq_data)**2)):.4f}")
     print(f"  SNR estimate: {10*np.log10(np.max(spectrum_shifted)/np.mean(spectrum_shifted)):.1f} dB")
     
-    return iq_data, fs
+    # Find peak frequency (IF estimation)
+    peak_freq_idx = np.argmax(spectrum_shifted)
+    peak_freq = f_shifted[peak_freq_idx]
+    print(f"  Peak Frequency (Est. IF): {peak_freq/1e6:.3f} MHz")
+    
+    return iq_data, fs, peak_freq
 
 
 if __name__ == "__main__":
